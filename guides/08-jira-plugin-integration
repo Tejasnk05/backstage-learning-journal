@@ -1,0 +1,207 @@
+# Jira Plugin Integration (New Frontend System)
+
+## What this achieves
+Shows a live Jira Overview card (issue counts, ticket table, activity stream) on a component's entity page in Backstage, pulled directly from a real Jira Cloud project.
+
+## Important context
+The official Roadie Jira plugin guide assumes the **old/legacy** Backstage frontend system (editing `packages/app/src/components/catalog/EntityPage.tsx`). This app uses the **new frontend system** (`createApp` from `@backstage/frontend-defaults`), where entity page content is registered as extensions instead. This guide adapts the plugin using that pattern — this same approach works for adapting most other legacy-only community plugins.
+
+## Prerequisites
+- A working Backstage app on the new frontend system
+- A component already registered in the catalog (e.g. via GitHub, with a `catalog-info.yaml`)
+- A Jira Cloud account with a project
+
+---
+
+## Part 1 — Install the plugin
+```powershell
+yarn --cwd packages/app add @roadiehq/backstage-plugin-jira
+```
+
+## Part 2 — Get Jira credentials
+
+1. Note your Jira Cloud URL, e.g. `https://yourcompany.atlassian.net`
+2. Create an API token: **https://id.atlassian.com/manage-profile/security/api-tokens** → "Create API token" → copy it immediately
+3. Build the Basic-auth string in PowerShell:
+```powershell
+$pair = "youremail@example.com:YOUR_API_TOKEN"
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($pair)
+$encoded = [Convert]::ToBase64String($bytes)
+Write-Output "Basic $encoded"
+```
+4. Set it as an environment variable in the terminal you'll run `yarn start` from:
+```powershell
+$env:JIRA_TOKEN="Basic <the encoded string>"
+```
+(This only lasts for the current terminal session — set it again each time you open a new one, or use a persistent secrets approach for anything beyond local testing.)
+
+## Part 3 — Config in `app-config.yaml`
+
+```yaml
+proxy:
+  '/jira/api':
+    target: 'https://yourcompany.atlassian.net'
+    headers:
+      Authorization: ${JIRA_TOKEN}
+      Accept: 'application/json'
+      Content-Type: 'application/json'
+      X-Atlassian-Token: 'nocheck'
+      User-Agent: "MY-UA-STRING"
+
+jira:
+  proxyPath: /jira/api
+  product: cloud   # 'cloud' or 'datacenter'
+
+backend:
+  csp:
+    img-src:
+      - "'self'"
+      - 'data:'
+      - 'https://yourcompany.atlassian.net'
+```
+
+## Part 4 — Entity card: `packages/app/src/catalog/JiraCard/index.tsx`
+
+> Note the `.tsx` extension — required because this file contains JSX. A `.ts` extension will fail to compile.
+
+```tsx
+import { EntityCardBlueprint } from '@backstage/plugin-catalog-react/alpha';
+import { compatWrapper } from '@backstage/core-compat-api';
+import React from 'react';
+import { EntityJiraOverviewCard, isJiraAvailable } from '@roadiehq/backstage-plugin-jira';
+
+export const jiraOverviewCard = EntityCardBlueprint.make({
+  name: 'jira-overview',
+  params: {
+    filter: isJiraAvailable,
+    loader: async () =>
+      compatWrapper(<EntityJiraOverviewCard />),
+  },
+});
+```
+`compatWrapper` bridges a legacy-style plugin component (built for the old `EntitySwitch`/`EntityPage.tsx` system) into the new frontend system.
+
+## Part 5 — Utility API: `packages/app/src/apis.ts`
+
+The plugin's `JiraAPI` class needs four dependencies to construct: `discoveryApi`, `configApi`, `fetchApi`, `errorApi`.
+
+```typescript
+import {
+  ApiBlueprint,
+  discoveryApiRef,
+  configApiRef,
+  fetchApiRef,
+  errorApiRef,
+} from '@backstage/frontend-plugin-api';
+import { jiraApiRef, JiraAPI } from '@roadiehq/backstage-plugin-jira';
+
+export const jiraApi = ApiBlueprint.make({
+  name: 'jira',
+  params: define =>
+    define({
+      api: jiraApiRef,
+      deps: {
+        discoveryApi: discoveryApiRef,
+        configApi: configApiRef,
+        fetchApi: fetchApiRef,
+        errorApi: errorApiRef,
+      },
+      factory: ({ discoveryApi, configApi, fetchApi, errorApi }) =>
+        new JiraAPI({ discoveryApi, configApi, fetchApi, errorApi }),
+    }),
+});
+```
+
+If a plugin's constructor requirements aren't documented, check them directly:
+```powershell
+Get-Content "node_modules\@roadiehq\backstage-plugin-jira\dist\api\index.esm.js" | Select-Object -First 40
+```
+
+## Part 6 — Wire both into `packages/app/src/App.tsx`
+
+```tsx
+import { createApp } from '@backstage/frontend-defaults';
+import catalogPlugin from '@backstage/plugin-catalog/alpha';
+import { navModule } from './modules/nav';
+
+import { githubAuthApiRef } from '@backstage/core-plugin-api';
+import { SignInPageBlueprint } from '@backstage/plugin-app-react';
+import { SignInPage } from '@backstage/core-components';
+import { createFrontendModule } from '@backstage/frontend-plugin-api';
+
+import { OrgPickerFieldExtension } from './scaffolder/OrgPicker';
+import { TeamPickerFieldExtension } from './scaffolder/TeamPicker';
+import { jiraOverviewCard } from './catalog/JiraCard';
+import { jiraApi } from './apis';
+
+const signInPage = SignInPageBlueprint.make({
+  params: {
+    loader: async () => props =>
+      (
+        <SignInPage
+          {...props}
+          provider={{
+            id: 'github-auth-provider',
+            title: 'GitHub',
+            message: 'Sign in using GitHub',
+            apiRef: githubAuthApiRef,
+          }}
+        />
+      ),
+  },
+});
+
+const scaffolderFieldExtensions = createFrontendModule({
+  pluginId: 'scaffolder',
+  extensions: [OrgPickerFieldExtension, TeamPickerFieldExtension],
+});
+
+const jiraModule = createFrontendModule({
+  pluginId: 'catalog',
+  extensions: [jiraOverviewCard, jiraApi],
+});
+
+export default createApp({
+  features: [
+    catalogPlugin,
+    navModule,
+    createFrontendModule({
+      pluginId: 'app',
+      extensions: [signInPage],
+    }),
+    scaffolderFieldExtensions,
+    jiraModule,
+  ],
+});
+```
+
+## Part 7 — Annotate the target component
+
+In the component's `catalog-info.yaml` (in its own repo, alongside its code):
+```yaml
+metadata:
+  annotations:
+    jira/project-key: YOUR_PROJECT_KEY   # e.g. the prefix on ticket IDs, like JMS in JMS-42
+```
+Commit and push this file to the component's repo — if the component was registered via a GitHub URL (`type: url` in `catalog.locations`), Backstage reads this file live from GitHub, not from any local copy.
+
+## Part 8 — Refresh and verify
+
+1. Restart `yarn start` (in the same terminal where `$env:JIRA_TOKEN` is set)
+2. Go to the component's entity page → "..." menu → "Schedule entity refresh" (or wait a few minutes for the automatic catalog refresh)
+3. Confirm the annotation landed:
+   ```
+   http://localhost:7007/api/catalog/entities/by-name/component/default/<component-name>
+   ```
+   Check the JSON for `"jira/project-key"`.
+4. Open the component's Overview tab — the Jira card should now show live issue counts, the ticket table, and the activity stream.
+
+## The general pattern (reusable for other legacy-only plugins)
+1. Install the package as usual.
+2. Add its proxy/config to `app-config.yaml` (backend-level config is usually unaffected by frontend system version).
+3. Wrap its entity component with `EntityCardBlueprint.make()` + `compatWrapper()`, instead of editing `EntityPage.tsx`.
+4. If it exposes a Utility API (`xApiRef` + a client class), register it with `ApiBlueprint.make()`, checking the actual installed source for the exact constructor dependencies.
+5. Register both extensions in `App.tsx` inside a `createFrontendModule` targeting the right `pluginId` (`catalog` for entity cards/APIs, `scaffolder` for template fields, etc.)
+
+## Key takeaway
+> Any Backstage plugin built for the legacy frontend system can still be used in a new-frontend-system app — it just needs to be wrapped in `EntityCardBlueprint`/`ApiBlueprint` + `compatWrapper`, rather than plugged into `EntityPage.tsx`.
